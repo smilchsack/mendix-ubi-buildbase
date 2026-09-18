@@ -188,9 +188,22 @@ jobs:
           set -euo pipefail
           image_ref="$BASE_IMAGE@$IMAGE_DIGEST"
           cosign sign --yes "$image_ref"
-          cosign verify "$image_ref" \
-            --certificate-identity "https://github.com/$GITHUB_WORKFLOW_REF" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          # Registry referrers can become visible shortly after the signature
+          # upload succeeds. Every attempt still requires full verification.
+          verified=false
+          for attempt in {1..12}; do
+            if cosign verify "$image_ref" \
+              --certificate-identity "https://github.com/$GITHUB_WORKFLOW_REF" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com; then
+              verified=true
+              break
+            fi
+            if [[ "$attempt" -lt 12 ]]; then
+              echo 'Waiting for the registry to expose the uploaded signature.'
+              sleep 5
+            fi
+          done
+          [[ "$verified" == true ]]
           printf 'Base: %s\n\n' "$image_ref" >> "$GITHUB_STEP_SUMMARY"
           docker image rm mendix-base:verification
           rm -r -- "$RUNNER_TEMP/release/base.oci"
