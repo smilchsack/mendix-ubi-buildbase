@@ -1,0 +1,216 @@
+name: Publish verified UBI build base
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-ubi-buildbase
+  cancel-in-progress: false
+
+env:
+  BASE_IMAGE: docker.io/smilchsack/mendix-ubi-buildbase
+  BASE_TAG: ubi9-2026-09
+  TRIVY_IMAGE: docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+  SKOPEO_IMAGE: quay.io/skopeo/stable:v1.22.2@sha256:2b7d76dde38c5924e1945348840c58786fc192201f2fd545832e58b53d26f7b8
+  SBOM_GENERATOR: docker.io/docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" ]]
+          mkdir -p "$RUNNER_TEMP/release" "$RUNNER_TEMP/trivy-cache"
+
+      - name: Check out the selected commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify the published matching source and notice archives
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import hashlib, json, os, urllib.request
+          from pathlib import Path
+          release = json.loads(Path("release-manifest.json").read_text())
+          assert release["tag"] == os.environ["BASE_TAG"]
+          base_line = next(line for line in Path("Dockerfile").read_text().splitlines() if line.startswith("FROM "))
+          assert base_line == "FROM " + release["base_image"]
+          assert {a["name"] for a in release["assets"]} == {"sources.tar.gz", "notices.tar.gz"}
+          for name in ("packages.tsv", "sources-manifest.json"):
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == release["files"][name]
+          packages = [line.split("\t") for line in Path("packages.tsv").read_text().splitlines()]
+          sources = json.loads(Path("sources-manifest.json").read_text())
+          source_names = {s["filename"] for s in sources}
+          assert {p[5] for p in packages} <= source_names
+          assert release["original_base_source_rpms"]
+          assert set(release["original_base_source_rpms"]) <= source_names
+          for asset in release["assets"]:
+              url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{release['tag']}/{asset['name']}"
+              digest = hashlib.sha256()
+              length = 0
+              with urllib.request.urlopen(url, timeout=120) as response:
+                  while chunk := response.read(1024 * 1024):
+                      digest.update(chunk)
+                      length += len(chunk)
+              assert digest.hexdigest() == asset["sha256"], asset["name"]
+              assert length == asset["bytes"], asset["name"]
+              print("Verified published asset:", asset["name"], length, "bytes")
+          PYTHON
+
+      - name: Set up the pinned BuildKit builder
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.37.1
+          driver-opts: image=moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      # Export once, then scan and publish that exact OCI layout. A second
+      # build could produce different contents and would invalidate the scan.
+      - name: Build the base with provenance and SBOM
+        id: build_base
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          pull: true
+          outputs: type=oci,tar=false,dest=${{ runner.temp }}/release/base.oci
+          tags: ${{ env.BASE_IMAGE }}:${{ env.BASE_TAG }}
+          provenance: mode=max
+          sbom: generator=${{ env.SBOM_GENERATOR }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.BASE_TAG }}
+
+      - name: Scan the base before any registry write
+        run: |
+          set -euo pipefail
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --volume "$RUNNER_TEMP/release:/release" \
+            --volume "$RUNNER_TEMP/trivy-cache:/cache" \
+            "$TRIVY_IMAGE" image --cache-dir /cache --no-progress \
+            --scanners vuln --format json --output /release/base-vulnerabilities.json \
+            --input /release/base.oci
+          # Fixable HIGH/CRITICAL findings block release. The JSON report also
+          # retains unfixed findings and lower severities for review.
+          python3 - "$RUNNER_TEMP/release/base-vulnerabilities.json" <<'PYTHON'
+          import json
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as report:
+              results = json.load(report).get("Results", [])
+          blocking = [v for r in results for v in (r.get("Vulnerabilities") or [])
+                      if v.get("Severity") in {"HIGH", "CRITICAL"} and v.get("FixedVersion")]
+          for finding in blocking:
+              print("Blocking:", finding["VulnerabilityID"], finding["PkgName"],
+                    "fixed in", finding["FixedVersion"])
+          print("Fixable HIGH/CRITICAL findings:", len(blocking))
+          sys.exit(bool(blocking))
+          PYTHON
+
+      - name: Smoke test the base from the scanned OCI layout
+        run: |
+          set -euo pipefail
+          docker run --rm --volume "$RUNNER_TEMP/release:/release:ro" \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            "$SKOPEO_IMAGE" --override-os linux --override-arch amd64 \
+            copy oci:/release/base.oci docker-daemon:mendix-base:verification
+          docker run --rm --network none --read-only --entrypoint /bin/sh \
+            mendix-base:verification -ec '
+              for version in 11 17 21; do
+                /usr/lib/jvm/java-${version}-openjdk/bin/java -version
+                /usr/lib/jvm/java-${version}-openjdk/bin/javac -version
+              done
+              rpm -q ca-certificates glibc-langpack-en fontconfig libgdiplus libicu
+              test ! -e /opt/mendix
+              test ! -e /opt/gradle
+            '
+
+      - name: Compare the image packages with the published source inventory
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only --entrypoint rpm mendix-base:verification \
+            -qa --qf '%{NAME}\t%{EPOCHNUM}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{SOURCERPM}\t%{LICENSE}\n' \
+            | awk -F '\t' '$1 != "gpg-pubkey"' | LC_ALL=C sort > "$RUNNER_TEMP/release/packages.tsv"
+          diff -u packages.tsv "$RUNNER_TEMP/release/packages.tsv"
+          ./verify.sh --image mendix-base:verification
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: docker.io
+          username: smilchsack
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish the exact scanned base and all attestations
+        id: publish_base
+        env:
+          EXPECTED_DIGEST: ${{ steps.build_base.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker_config_dir="${DOCKER_CONFIG:-$HOME/.docker}"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --volume "$RUNNER_TEMP/release:/release" \
+            --volume "$docker_config_dir:/auth:ro" \
+            "$SKOPEO_IMAGE" copy --all --preserve-digests \
+            --dest-authfile /auth/config.json --digestfile /release/base.digest \
+            oci:/release/base.oci "docker://$BASE_IMAGE:$BASE_TAG"
+          actual_digest=$(cat "$RUNNER_TEMP/release/base.digest")
+          [[ "$actual_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$actual_digest" == "$EXPECTED_DIGEST" ]]
+          printf 'digest=%s\n' "$actual_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Sign and verify the base digest
+        env:
+          IMAGE_DIGEST: ${{ steps.publish_base.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image_ref="$BASE_IMAGE@$IMAGE_DIGEST"
+          cosign sign --yes "$image_ref"
+          cosign verify "$image_ref" \
+            --certificate-identity "https://github.com/$GITHUB_WORKFLOW_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          printf 'Base: %s\n\n' "$image_ref" >> "$GITHUB_STEP_SUMMARY"
+          docker image rm mendix-base:verification
+          rm -r -- "$RUNNER_TEMP/release/base.oci"
+
+      - name: Publish the scan report and release digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ steps.publish_base.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '%s@%s\n' "$BASE_IMAGE" "$IMAGE_DIGEST" > "$RUNNER_TEMP/release/image-digest.txt"
+          gh release upload "$BASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/release/base-vulnerabilities.json" \
+            "$RUNNER_TEMP/release/image-digest.txt" --clobber
+
+      - name: Preserve vulnerability reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vulnerability-reports
+          path: ${{ runner.temp }}/release/*-vulnerabilities.json
+          if-no-files-found: ignore
+          retention-days: 90
